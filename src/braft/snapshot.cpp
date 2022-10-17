@@ -618,6 +618,7 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
         if (0 != ret) {
             break;
         }
+        // 保存snapshot meta到磁盘文件
         ret = writer->sync();
         if (ret != 0) {
             break;
@@ -761,17 +762,21 @@ void *LocalSnapshotCopier::start_copy(void* arg) {
 
 void LocalSnapshotCopier::copy() {
     do {
+        // 加载remote meta信息，具体实现为将远程的meta文件读取到内存的IOBuf，然后进行解析
         load_meta_table();
         if (!ok()) {
             break;
         }
+        // 根据开关，允许对和本地snapshot中文件名和校验和相同的文件跳过下载
         filter();
         if (!ok()) {
             break;
         }
         std::vector<std::string> files;
         _remote_snapshot.list_files(&files);
+        // 逐个拷贝文件
         for (size_t i = 0; i < files.size() && ok(); ++i) {
+            // 通过文件操作RPC，将文件分段拷贝过来。
             copy_file(files[i]);
         }
     } while (0);

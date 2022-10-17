@@ -1047,6 +1047,7 @@ int SegmentLogStorage::list_segments(bool is_empty) {
             return -1;
         } else if (last_log_index != -1 &&
                    segment->first_index() != last_log_index + 1) {
+            // 检查segment必须有序，log index要求连续
             LOG(WARNING) << "closed segment not in order, path: " << _path
                 << " first_index: " << segment->first_index()
                 << " last_log_index: " << last_log_index;

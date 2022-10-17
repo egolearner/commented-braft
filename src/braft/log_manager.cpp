@@ -333,9 +333,10 @@ void LogManager::unsafe_truncate_suffix(const int64_t last_index_kept) {
 
 int LogManager::check_and_resolve_conflict(
             std::vector<LogEntry*> *entries, StableClosure* done) {
-    AsyncClosureGuard done_guard(done);   
+    AsyncClosureGuard done_guard(done);
     if (entries->front()->id.index == 0) {
-        // Node is currently the leader and |entries| are from the user who 
+        // 某些情况下leader会设置index
+        // Node is currently the leader and |entries| are from the user who
         // don't know the correct indexes the logs should assign to. So we have
         // to assign indexes to the appending entries
         for (size_t i = 0; i < entries->size(); ++i) {
@@ -344,9 +345,12 @@ int LogManager::check_and_resolve_conflict(
         done_guard.release();
         return 0;
     } else {
+        // follower逻辑
+
         // Node is currently a follower and |entries| are from the leader. We 
         // should check and resolve the confliction between the local logs and
         // |entries|
+        // 日志不连续性，报错
         if (entries->front()->id.index > _last_log_index + 1) {
             done->status().set_error(EINVAL, "There's gap between first_index=%" PRId64
                                      " and last_log_index=%" PRId64,
@@ -354,6 +358,7 @@ int LogManager::check_and_resolve_conflict(
             return -1;
         }
         const int64_t applied_index = _applied_id.index;
+        // 如果最后一条日志已经apply过，直接返回
         if (entries->back()->id.index <= applied_index) {
             LOG(WARNING) << "Received entries of which the last_log="
                          << entries->back()->id.index
@@ -363,12 +368,14 @@ int LogManager::check_and_resolve_conflict(
         }
 
         if (entries->front()->id.index == _last_log_index + 1) {
+            // 第一条日志正好对上，只需要更新_last_log_index
             // Fast path
             _last_log_index = entries->back()->id.index;
         } else {
             // Appending entries overlap the local ones. We should find if there
             // is a conflicting index from which we should truncate the local
             // ones.
+            // 找到第一个冲突的日志index
             size_t conflicting_index = 0;
             for (; conflicting_index < entries->size(); ++conflicting_index) {
                 if (unsafe_get_term((*entries)[conflicting_index]->id.index)
@@ -376,10 +383,12 @@ int LogManager::check_and_resolve_conflict(
                     break;
                 }
             }
+            // 如果存在冲突
             if (conflicting_index != entries->size()) {
                 if ((*entries)[conflicting_index]->id.index <= _last_log_index) {
                     // Truncate all the conflicting entries to make local logs
                     // consensus with the leader.
+                    // truncate日志
                     unsafe_truncate_suffix(
                             (*entries)[conflicting_index]->id.index - 1);
                 }
@@ -393,6 +402,7 @@ int LogManager::check_and_resolve_conflict(
             for (size_t i = 0; i < conflicting_index; ++i) {
                 (*entries)[i]->Release();
             }
+            // 不冲突的日志直接移除，因为已经持久化过了
             entries->erase(entries->begin(), 
                            entries->begin() + conflicting_index);
         }
@@ -446,7 +456,7 @@ void LogManager::append_entries(
     wakeup_all_waiter(lck);
 }
 
-void LogManager::append_to_storage(std::vector<LogEntry*>* to_append, 
+void LogManager::append_to_storage(std::vector<LogEntry*>* to_append,
                                    LogId* last_id, IOMetric* metric) {
     if (!_has_error.load(butil::memory_order_relaxed)) {
         size_t written_size = 0;
@@ -456,6 +466,7 @@ void LogManager::append_to_storage(std::vector<LogEntry*>* to_append,
         butil::Timer timer;
         timer.start();
         g_storage_append_entries_concurrency << 1;
+        // 调用底层存储实现，默认为SegmentLogStorage
         int nappent = _log_storage->append_entries(*to_append, metric);
         g_storage_append_entries_concurrency << -1;
         timer.stop();
@@ -501,6 +512,7 @@ public:
     void flush() {
         if (_size > 0) {
             IOMetric metric;
+            // 调log manager来写盘
             _lm->append_to_storage(&_to_append, _last_id, &metric);
             g_storage_flush_batch_counter << _size;
             for (size_t i = 0; i < _size; ++i) {
@@ -510,6 +522,7 @@ public:
                             EIO, "Corrupted LogStorage");
                 }
                 _storage[i]->update_metric(&metric);
+                // 执行回调
                 _storage[i]->Run();
             }
             _to_append.clear();
@@ -522,8 +535,9 @@ public:
                 _buffer_size >= (size_t)FLAGS_raft_max_append_buffer_size) {
             flush();
         }
+        // 加入列表，并更新统计字段
         _storage[_size++] = done;
-        _to_append.insert(_to_append.end(), 
+        _to_append.insert(_to_append.end(),
                          done->_entries.begin(), done->_entries.end());
         for (size_t i = 0; i < done->_entries.size(); ++i) {
             _buffer_size += done->_entries[i]->data.length();
@@ -559,10 +573,13 @@ int LogManager::disk_thread(void* meta,
         done->metric.bthread_queue_time_us = butil::cpuwide_time_us() - 
                                             done->metric.start_time_us;
         if (!done->_entries.empty()) {
+            // 组batch
             ab.append(done);
         } else {
+            // 刷盘
             ab.flush();
             int ret = 0;
+            // 日志项为空的任务，是一些管理类的任务。如LastLogIdClosure, TruncatePrefixClosure, TruncateSuffixClosure, ResetClosure
             do {
                 LastLogIdClosure* llic =
                         dynamic_cast<LastLogIdClosure*>(done);
@@ -652,14 +669,18 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     // has these logs on disk storage. Just leave disk_id as it was, which can keep
     // these logs in memory all the time until they are flushed to disk. By this 
     // way we can avoid some corner cases which failed to get logs.
-    
+
     if (term == 0) {
+        // 如果term等于0，说明last_included_index大于last_index（一般发生在follower处），
+        // 则把缓存和文件里面的log entry从前面截断到last_included_index
         // last_included_index is larger than last_index
         // FIXME: what if last_included_index is less than first_index?
         _virtual_first_log_id = _last_snapshot_id;
         truncate_prefix(meta->last_included_index() + 1, lck);
         return;
     } else if (term == meta->last_included_term()) {
+        // 如果term等于 meta->last_included_term，说明log entry里面还存在着这条记录，
+        // 先不着急截断，把它截断到上一个快照处(如果有的话)。
         // Truncating log to the index of the last snapshot.
         // We don't truncate log before the latest snapshot immediately since
         // some log around last_snapshot_index is probably needed by some
@@ -671,6 +692,10 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
         }
         return;
     } else {
+        // 其他情况对应index上的term不等于meta->last_included_term，
+        // 则可能是follower处正在安装快照，这种情况，直接reset，
+        // 让_first_log_index指向last_included_index，
+        // _last_log_index指向last_included_index-1，把entries清空。
         // TODO: check the result of reset.
         _virtual_first_log_id = _last_snapshot_id;
         reset(meta->last_included_index() + 1, lck);

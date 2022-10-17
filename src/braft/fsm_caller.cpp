@@ -322,6 +322,7 @@ int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
     ApplyTask task;
     task.type = SNAPSHOT_SAVE;
     task.done = done;
+    // 加入队列等待执行
     return bthread::execution_queue_execute(_queue_id, task);
 }
 
@@ -346,6 +347,7 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
         *meta.add_old_peers() = iter->to_string();
     }
 
+    // 将meta保存到writer对象中
     SnapshotWriter* writer = done->start(meta);
     if (!writer) {
         done->status().set_error(EINVAL, "snapshot_storage create SnapshotWriter failed");

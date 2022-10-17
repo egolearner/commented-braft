@@ -42,6 +42,7 @@ void RaftServiceImpl::pre_vote(google::protobuf::RpcController* cntl_base,
         return;
     }
 
+    // 获取node对象
     scoped_refptr<NodeImpl> node_ptr = 
                         global_node_manager->get(request->group_id(), peer_id);
     NodeImpl* node = node_ptr.get();

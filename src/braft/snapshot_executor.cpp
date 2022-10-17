@@ -215,6 +215,7 @@ int SnapshotExecutor::on_snapshot_save_done(
         }
     }
 
+    // 默认调用LocalSnapshotStorage，保存snapshot meta信息到文件，将snapshot目录从临时路径重命名为最终路径
     if (_snapshot_storage->close(writer) != 0) {
         ret = EIO;
         LOG(WARNING) << "node " << _node->node_id() << " fail to close writer";
@@ -325,6 +326,7 @@ void* SaveSnapshotDone::continue_run(void* arg) {
 }
 
 void SaveSnapshotDone::Run() {
+    // 启动bthread来避免阻塞状态机
     // Avoid blocking FSMCaller
     // This continuation of snapshot saving is likely running inplace where the
     // on_snapshot_save is called (in the FSMCaller thread) and blocks all the
@@ -438,11 +440,13 @@ void SnapshotExecutor::install_snapshot(brpc::Controller* cntl,
     // Release done first as this RPC might be replaced by the retry one
     done_guard.release();
     CHECK(_cur_copier);
+    // 等待copy的bthread执行完成
     _cur_copier->join();
     // when copying finished or canceled, more install_snapshot tasks are allowed
     if (_snapshot_throttle) {
         _snapshot_throttle->finish_one_task(false);
     }
+    // 加载下载的snapshot
     return load_downloading_snapshot(ds.release(), meta);
 }
 
@@ -495,6 +499,7 @@ void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
     lck.unlock();
     InstallSnapshotDone* install_snapshot_done =
             new InstallSnapshotDone(this, reader);
+    // 调用用户的snapshot load实现
     int ret = _fsm_caller->on_snapshot_load(install_snapshot_done);
     if (ret != 0) {
         LOG(WARNING) << "node " << _node->node_id() << " fail to call on_snapshot_load";
@@ -534,6 +539,7 @@ int SnapshotExecutor::register_downloading_snapshot(DownloadingSnapshot* ds) {
         _downloading_snapshot.store(ds, butil::memory_order_relaxed);
         // Now this session has the right to download the snapshot.
         CHECK(!_cur_copier);
+        // 启动一个bthread来从远程copy snapshot
         _cur_copier = _snapshot_storage->start_to_copy_from(ds->request->uri());
         if (_cur_copier == NULL) {
             _downloading_snapshot.store(NULL, butil::memory_order_relaxed);

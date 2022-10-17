@@ -674,6 +674,7 @@ void NodeImpl::apply(const Task& task) {
     m.entry = entry;
     m.done = task.done;
     m.expected_term = task.expected_term;
+    // 执行的时候调用execute_applying_tasks
     if (_apply_queue->execute(m, &bthread::TASK_OPTIONS_INPLACE, NULL) != 0) {
         task.done->status().set_error(EPERM, "Node is down");
         entry->Release();
@@ -742,6 +743,7 @@ void NodeImpl::on_caughtup(const PeerId& peer, int64_t term,
     }
 
     // Retry if this peer is still alive
+    // 如果超时再次重试
     if (st.error_code() == ETIMEDOUT 
             && (butil::monotonic_time_ms()
                 - _replicator_group.last_rpc_send_timestamp(peer))
@@ -819,6 +821,7 @@ void NodeImpl::handle_stepdown_timeout() {
 void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
                                            const Configuration& new_conf,
                                            Closure* done) {
+    // 非leader报错
     if (_state != STATE_LEADER) {
         LOG(WARNING) << "[" << node_id()
                      << "] Refusing configuration changing because the state is "
@@ -835,6 +838,7 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
     }
 
     // check concurrent conf change
+    // 如果在更新conf，则报错
     if (_conf_ctx.is_busy()) {
         LOG(WARNING) << "[" << node_id()
                      << " ] Refusing concurrent configuration changing";
@@ -846,6 +850,7 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
     }
 
     // Return immediately when the new peers equals to current configuration
+    // conf不变直接返回
     if (_conf.conf.equals(new_conf)) {
         run_closure_in_bthread(done);
         return;
@@ -1047,8 +1052,10 @@ void NodeImpl::handle_election_timeout() {
     butil::Status status;
     status.set_error(ERAFTTIMEDOUT, "Lost connection from leader %s",
                                     _leader_id.to_string().c_str());
+    // 里面会根据情况情况回调on_start_following/on_stop_following
     reset_leader_id(empty_id, status);
 
+    // 发起预选举
     return pre_vote(&lck, triggered);
     // Don't touch any thing of *this ever after
 }
@@ -1376,7 +1383,7 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
                      << " term " << term << " current_term " << _current_term;
         return;
     }
-    // check response term
+    // check response term，response term更大则停止选举
     if (response.term() > _current_term) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received invalid RequestVoteResponse from " << peer_id
@@ -1414,6 +1421,7 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
         // the candidate will try again after it disrupt the old leader.
         _vote_ctx.reserve(peer_id);
     }
+    // 再次要求预留的peer投票
     retry_vote_on_reserved_peers();
 }
 
@@ -1485,7 +1493,7 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
                      << " term " << term << " current_term " << _current_term;
         return;
     }
-    // check response term
+    // check response term，收到的term更大则放弃选举
     if (response.term() > _current_term) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received invalid PreVoteResponse from " << peer_id
@@ -1587,6 +1595,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         return;
     }
 
+    // 获取last log的term和id
     int64_t old_term = _current_term;
     // get last_log_id outof node mutex
     lck->unlock();
@@ -1603,6 +1612,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
 
+    // 向所有peer发烧pre_vote请求
     for (std::set<PeerId>::const_iterator
             iter = peers.begin(); iter != peers.end(); ++iter) {
         if (*iter == _server_id) {
@@ -1631,6 +1641,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         RaftService_Stub stub(&channel);
         stub.pre_vote(&done->cntl, &done->request, &done->response, done);
     }
+    // 给自己投票
     grant_self(&_pre_vote_ctx, lck);
 }
 
@@ -1659,12 +1670,15 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
                                     "as it begins to request_vote.");
     reset_leader_id(empty_id, status);
 
+    // 修改状态
     _state = STATE_CANDIDATE;
+    // term加1
     _current_term++;
     _voted_id = _server_id;
 
     BRAFT_VLOG << "node " << _group_id << ":" << _server_id
                << " term " << _current_term << " start vote_timer";
+    // 启动vote定时器
     _vote_timer.start();
     _pre_vote_ctx.reset(this);
     _vote_ctx.init(this, false);
@@ -1866,6 +1880,7 @@ void NodeImpl::check_step_down(const int64_t request_term, const PeerId& server_
                 "from new leader with the same term.");
         step_down(request_term, false, status); 
     }
+    // 不知道leader是谁时收到了append entries，记住leader身份
     // save current leader
     if (_leader_id.is_empty()) { 
         reset_leader_id(server_id, status);
@@ -1898,6 +1913,7 @@ void NodeImpl::become_leader() {
     _vote_timer.stop();
     _vote_ctx.reset(this);
 
+    // 修改状态和leader_id
     _state = STATE_LEADER;
     _leader_id = _server_id;
 
@@ -1907,6 +1923,7 @@ void NodeImpl::become_leader() {
 
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
+    // 每个follower启动一个replicator
     for (std::set<PeerId>::const_iterator
             iter = peers.begin(); iter != peers.end(); ++iter) {
         if (*iter == _server_id) {
@@ -2005,6 +2022,7 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
         return;
     }
     for (size_t i = 0; i < size; ++i) {
+        // 检查ABA问题
         if (tasks[i].expected_term != -1 && tasks[i].expected_term != _current_term) {
             BRAFT_VLOG << "node " << _group_id << ":" << _server_id
                       << " can't apply taks whose expected_term=" << tasks[i].expected_term
@@ -2041,6 +2059,7 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
     LogEntry* entry = new LogEntry();
     entry->AddRef();
     entry->id.term = _current_term;
+    // 产生一个配置变更的日志项
     entry->type = ENTRY_TYPE_CONFIGURATION;
     entry->peers = new std::vector<PeerId>;
     new_conf.list_peers(entry->peers);
@@ -2055,6 +2074,7 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
 
     std::vector<LogEntry*> entries;
     entries.push_back(entry);
+    // append 日志项
     _log_manager->append_entries(&entries,
                                  new LeaderStableClosure(
                                         NodeId(_group_id, _server_id),
@@ -2223,6 +2243,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
             step_down(request->term(), false, status);
             _voted_id = candidate_id;
             //TODO: outof lock
+            // 投票需要持久化存储
             status = _meta_storage->
                     set_term_and_votedfor(_current_term, candidate_id, _v_group_id);
             if (!status.ok()) {
@@ -2378,6 +2399,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
     }
 
     // check stale term
+    // 让已被篡位的leader下台
     if (request->term() < _current_term) {
         const int64_t saved_current_term = _current_term;
         lck.unlock();
@@ -2392,7 +2414,8 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 
     // check term and state to step down
     check_step_down(request->term(), server_id);   
-     
+
+    // 如果有两个相同term的leader，自己的term加一让两个leader都下台
     if (server_id != _leader_id) {
         LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
                    << " declares that it is the leader at term=" << _current_term 
@@ -2412,6 +2435,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         _follower_lease.renew(_leader_id);
     }
 
+    // 正在安装snapshot则报错返回
     if (request->entries_size() > 0 &&
             (_snapshot_executor
                 && _snapshot_executor->is_installing_snapshot())) {
@@ -2589,6 +2613,7 @@ void NodeImpl::handle_install_snapshot_request(brpc::Controller* cntl,
     }
 
     // check stale term
+    // 让过期的leader退位
     if (request->term() < _current_term) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " ignore stale InstallSnapshot from " << request->server_id()
@@ -2601,6 +2626,7 @@ void NodeImpl::handle_install_snapshot_request(brpc::Controller* cntl,
     
     check_step_down(request->term(), server_id);
 
+    // 如果接收到了另一个peer的install snapshot请求，term加1，让两个leader都退位
     if (server_id != _leader_id) {
         LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
                    << " declares that it is the leader at term=" << _current_term 
@@ -3162,11 +3188,13 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
     CHECK(!is_busy());
     CHECK(!_done);
     _done = done;
+    // 设置状态为追赶阶段
     _stage = STAGE_CATCHING_UP;
     old_conf.list_peers(&_old_peers);
     new_conf.list_peers(&_new_peers);
     Configuration adding;
     Configuration removing;
+    // diff得到节点变化
     new_conf.diffs(old_conf, &adding, &removing);
     _nchanges = adding.size() + removing.size();
 
@@ -3193,6 +3221,7 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
                 _node, _node->_current_term, *iter, _version);
         timespec due_time = butil::milliseconds_from_now(
                 _node->_options.get_catchup_timeout_ms());
+        // 对新增节点，等待新节点数据追的差不多，默认margin为1000
         if (_node->_replicator_group.wait_caughtup(
             *iter, _node->_options.catchup_margin, &due_time, caught_up) != 0) {
             LOG(WARNING) << "node " << _node->node_id()
@@ -3230,6 +3259,7 @@ void NodeImpl::ConfigurationCtx::on_caughtup(
     CHECK_EQ(STAGE_CATCHING_UP, _stage);
     if (succ) {
         _adding_peers.erase(peer_id);
+        // add的节点为空则进入下一阶段
         if (_adding_peers.empty()) {
             return next_stage();
         }
@@ -3243,6 +3273,7 @@ void NodeImpl::ConfigurationCtx::on_caughtup(
                  << Configuration(_new_peers);
     butil::Status err(ECATCHUP, "Peer %s failed to catch up",
                       peer_id.to_string().c_str());
+    // 失败重置
     reset(&err);
 }
 

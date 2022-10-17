@@ -144,6 +144,7 @@ int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
     r->_update_last_rpc_send_timestamp(butil::monotonic_time_ms());
     r->_start_heartbeat_timer(butil::gettimeofday_us());
     // Note: r->_id is unlock in _send_empty_entries, don't touch r ever after
+    // 发送no_op来宣示leader身份
     r->_send_empty_entries(false);
     return 0;
 }
@@ -197,6 +198,7 @@ void Replicator::wait_for_caught_up(ReplicatorId id,
     }
     if (due_time != NULL) {
         done->_has_timer = true;
+        // 创建定时器
         if (bthread_timer_add(&done->_timer,
                               *due_time,
                               _on_catch_up_timedout,
@@ -277,6 +279,7 @@ void Replicator::_on_heartbeat_returned(
     Replicator *r = NULL;
     bthread_id_t dummy_id = { id };
     const long start_time_us = butil::gettimeofday_us();
+    // XXX bthread_id大概相当于pthread key
     if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
         return;
     }
@@ -297,11 +300,13 @@ void Replicator::_on_heartbeat_returned(
                         << " fail to issue RPC to " << r->_options.peer_id
                         << " _consecutive_error_times=" << r->_consecutive_error_times
                         << ", " << cntl->ErrorText();
+        // 如果失败则再次启动定时器
         r->_start_heartbeat_timer(start_time_us);
         CHECK_EQ(0, bthread_id_unlock(dummy_id)) << "Fail to unlock " << dummy_id;
         return;
     }
     r->_consecutive_error_times = 0;
+    // 如果心跳收到更高的term，则退位
     if (response->term() > r->_options.term) {
         ss << " fail, greater term " << response->term()
            << " expect term " << r->_options.term;
@@ -406,6 +411,7 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
     }
     r->_consecutive_error_times = 0;
     if (!response->success()) {
+        // 如果响应中的term更大则退位
         if (response->term() > r->_options.term) {
             BRAFT_VLOG << " fail, greater term " << response->term()
                        << " expect term " << r->_options.term;
@@ -431,13 +437,15 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
         r->_update_last_rpc_send_timestamp(rpc_send_time);
         // prev_log_index and prev_log_term doesn't match
         r->_reset_next_index();
+        // log index 不匹配则直接设置next_index
         if (response->last_log_index() + 1 < r->_next_index) {
             BRAFT_VLOG << "Group " << r->_options.group_id
                        << " last_log_index at peer=" << r->_options.peer_id 
                        << " is " << response->last_log_index();
             // The peer contains less logs than leader
             r->_next_index = response->last_log_index() + 1;
-        } else {  
+        } else {
+            // 否则依次减1直到匹配(XXX 看下面的实现不是term不匹配导致的，那什么情况会走到这个逻辑？）
             // The peer contains logs from old term which should be truncated,
             // decrease _last_log_at_peer by one to test the right index to keep
             if (BAIDU_LIKELY(r->_next_index > 1)) {
@@ -452,6 +460,7 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
             }
         }
         // dummy_id is unlock in _send_heartbeat
+        // 用于更新log index信息
         r->_send_empty_entries(false);
         return;
     }
@@ -476,6 +485,7 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                                     << rpc_last_log_index
                                     << "] to peer " << r->_options.peer_id;
     if (entries_size > 0) {
+        // 检查是否通过投票
         r->_options.ballot_box->commit_at(
                 min_flying_index, rpc_last_log_index,
                 r->_options.peer_id);
@@ -510,6 +520,7 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
     if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
         r->_send_timeout_now(false, false);
     }
+    // 再次调用send
     r->_send_entries();
     return;
 }
@@ -777,6 +788,7 @@ void Replicator::_install_snapshot() {
     // blocked if something is wrong, such as throttled for a period of time 
     _st.st = INSTALLING_SNAPSHOT;
 
+    // 返回最新的快照reader，默认实现为LocalSnapshotReader
     _reader = _options.snapshot_storage->open();
     if (!_reader) {
         if (_options.snapshot_throttle) {
@@ -791,7 +803,9 @@ void Replicator::_install_snapshot() {
         node_impl->on_error(e);
         node_impl->Release();
         return;
-    } 
+    }
+    // 生成copy的uri，格式为 remote://host:port/reader_id_number
+    // 通过reader id可以区分不同的读者
     std::string uri = _reader->generate_uri_for_copy();
     // NOTICE: If uri is something wrong, retry later instead of reporting error
     // immediately(making raft Node error), as FileSystemAdaptor layer of _reader is 
@@ -826,6 +840,7 @@ void Replicator::_install_snapshot() {
     request->set_group_id(_options.group_id);
     request->set_server_id(_options.server_id.to_string());
     request->set_peer_id(_options.peer_id.to_string());
+    // 设置meta和uri
     request->mutable_meta()->CopyFrom(meta);
     request->set_uri(uri);
 
@@ -862,6 +877,7 @@ void Replicator::_on_install_snapshot_returned(
         return;
     }
     if (r->_reader) {
+        // 关闭reader
         r->_options.snapshot_storage->close(r->_reader);
         r->_reader = NULL;
         if (r->_options.snapshot_throttle) {
